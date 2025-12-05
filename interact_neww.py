@@ -4,9 +4,10 @@ import pandas as pd
 import datetime
 import ccxt  # 必須先 pip install ccxt
 import time
+import matplotlib.pyplot as plt # 引入繪圖庫
 
 # ==========================================
-# 策略核心：PriceActionSMCStrategy (嚴格版)
+# 策略核心：PriceActionSMCStrategy (嚴格版 - 含繪圖數據記錄)
 # ==========================================
 class PriceActionSMCStrategy(bt.Strategy):
     params = (
@@ -21,6 +22,10 @@ class PriceActionSMCStrategy(bt.Strategy):
         self.anchor_price = None    
         self.peak_price = None      
         self.retraced_deep = False  
+        
+        # === 新增：用於繪製資金曲線的列表 ===
+        self.equity_curve = []
+        self.date_curve = []
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.datetime(0)
@@ -42,6 +47,11 @@ class PriceActionSMCStrategy(bt.Strategy):
             self.orders = None
 
     def next(self):
+        # === 新增：記錄每個 K 線結束時的資金與時間 ===
+        self.equity_curve.append(self.broker.getvalue())
+        self.date_curve.append(self.datas[0].datetime.datetime(0))
+
+        # === 以下為您原本的策略邏輯 (完全未變動) ===
         close = self.datas[0].close[0]
         high = self.datas[0].high[0]
         low = self.datas[0].low[0]
@@ -138,18 +148,12 @@ class PriceActionSMCStrategy(bt.Strategy):
 # 工具函數：從幣安 (Binance) 下載長歷史數據
 # ==========================================
 def fetch_binance_data(symbol, timeframe, start_str, end_str):
-    """
-    使用 ccxt 從幣安下載歷史 K 線
-    symbol: 'BTC/USDT'
-    timeframe: '30m', '1h', '4h'
-    """
     exchange = ccxt.binance()
-    # 轉換時間格式為 timestamp (毫秒)
     since = exchange.parse8601(start_str + 'T00:00:00Z')
     end_ts = exchange.parse8601(end_str + 'T00:00:00Z')
     
     all_ohlcv = []
-    limit = 1000 # 幣安單次限制 1000 筆
+    limit = 1000 
 
     print(f"正在從 Binance 下載 {timeframe} 數據 (可能需要一點時間)...")
     
@@ -159,9 +163,8 @@ def fetch_binance_data(symbol, timeframe, start_str, end_str):
             if len(ohlcv) == 0:
                 break
             all_ohlcv += ohlcv
-            since = ohlcv[-1][0] + 1 # 更新下次下載的時間點
-            # print(f"已下載到: {exchange.iso8601(since)}") # 除錯用
-            time.sleep(0.1) # 避免觸發 API 限制
+            since = ohlcv[-1][0] + 1 
+            time.sleep(0.1) 
         except Exception as e:
             print(f"下載中斷: {e}")
             break
@@ -172,8 +175,6 @@ def fetch_binance_data(symbol, timeframe, start_str, end_str):
     df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
     df.set_index('datetime', inplace=True)
-    
-    # 截取用戶需要的結束時間
     df = df[df.index <= end_str]
     return df
 
@@ -182,7 +183,7 @@ def fetch_binance_data(symbol, timeframe, start_str, end_str):
 # ==========================================
 if __name__ == '__main__':
     print("=========================================")
-    print("      SMC 策略回測 (支援長週期 30m)      ")
+    print("      SMC 策略回測 (含資金曲線圖)        ")
     print("=========================================")
     
     try:
@@ -197,7 +198,6 @@ if __name__ == '__main__':
     end_date = datetime.datetime.now()
     start_date = end_date - datetime.timedelta(days=days_back)
     
-    # 格式化日期字串 (給幣安用)
     start_str = start_date.strftime('%Y-%m-%d')
     end_str = end_date.strftime('%Y-%m-%d')
 
@@ -214,17 +214,12 @@ if __name__ == '__main__':
     data_df = pd.DataFrame()
 
     # ====== 數據下載邏輯 ======
-    # 如果是 30m 且超過 59 天 -> 強制用 Binance
     if tf_input == '30m' and days_back > 59:
         print("💡 檢測到長週期 30m 需求，切換至 Binance 下載數據...")
-        # 注意：Yahoo 是 'BTC-USD', 幣安是 'BTC/USDT'
         data_df = fetch_binance_data('BTC/USDT', '30m', start_str, end_str)
-    
-    # 其他情況 (1h, 4h 或 短期 30m) -> 優先嘗試 Yahoo Finance (比較快)
     else:
         print("💡 使用 Yahoo Finance 下載數據...")
         yf_interval = '1h' if tf_input == '4h' else tf_input
-        # Yahoo 的 30m 限制防呆
         if tf_input == '30m' and days_back > 59:
             print("⚠️ Yahoo 限制 30m 最多 60 天，已自動修正起始日。")
             real_start = end_date - datetime.timedelta(days=59)
@@ -235,14 +230,12 @@ if __name__ == '__main__':
         if isinstance(data_df.columns, pd.MultiIndex):
             data_df.columns = data_df.columns.get_level_values(0)
 
-    # 檢查數據
     if data_df.empty:
         print("❌ 錯誤：無法下載數據。")
         exit()
 
     data = bt.feeds.PandasData(dataname=data_df)
 
-    # 載入 Backtrader
     if tf_input == '4h':
         print("模式：重採樣 1h -> 4h")
         cerebro.resampledata(data, timeframe=bt.TimeFrame.Minutes, compression=60*4)
@@ -250,7 +243,9 @@ if __name__ == '__main__':
         print(f"模式：直接使用 {tf_input} 數據")
         cerebro.adddata(data)
 
-    cerebro.run()
+    print("開始回測，請稍候...")
+    results = cerebro.run()
+    strat = results[0]
     
     print('\n=========================================')
     final_value = cerebro.broker.getvalue()
@@ -258,3 +253,20 @@ if __name__ == '__main__':
     print(f'最終資金: {final_value:.2f}')
     print(f'總回報率: {roi:.2f}%')
     print('=========================================')
+
+    # === 新增：繪製資金曲線圖 ===
+    print("正在繪製資金曲線圖...")
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(strat.date_curve, strat.equity_curve, label='Equity Curve', color='blue')
+    
+    # 標記初始資金線 (紅色虛線)
+    plt.axhline(y=start_cash, color='red', linestyle='--', label='Initial Capital')
+    
+    plt.title(f'SMC Strategy Performance ({tf_input})', fontsize=15)
+    plt.xlabel('Date')
+    plt.ylabel('Account Value')
+    plt.legend()
+    plt.grid(True, alpha=0.5)
+    plt.tight_layout()
+    plt.show()
